@@ -1,5 +1,7 @@
 import tensorflow as tf
 import numpy as np
+import os
+import warnings
 from .common import _FLOATX, _EPSILON
 
 # INTERNAL UTILS
@@ -7,14 +9,18 @@ from .common import _FLOATX, _EPSILON
 _SESSION = None
 
 
-def _get_session():
+def get_session():
     global _SESSION
     if _SESSION is None:
-        _SESSION = tf.Session('')
+        if not os.environ.get('OMP_NUM_THREADS'):
+            _SESSION = tf.Session(config=tf.ConfigProto(allow_soft_placement=True))
+        else:
+            nb_thread = int(os.environ.get('OMP_NUM_THREADS'))
+            _SESSION = tf.Session(config=tf.ConfigProto(intra_op_parallelism_threads=nb_thread, allow_soft_placement=True))
     return _SESSION
 
 
-def _set_session(session):
+def set_session(session):
     global _SESSION
     _SESSION = session
 
@@ -23,7 +29,7 @@ def _set_session(session):
 
 def variable(value, dtype=_FLOATX, name=None):
     v = tf.Variable(np.asarray(value, dtype=dtype), name=name)
-    _get_session().run(v.initializer)
+    get_session().run(v.initializer)
     return v
 
 
@@ -35,7 +41,13 @@ def placeholder(shape=None, ndim=None, dtype=_FLOATX, name=None):
 
 
 def shape(x):
-    return x.get_shape()
+    # symbolic shape
+    return tf.shape(x)
+
+
+def int_shape(x):
+    shape = x.get_shape()
+    return tuple([i.__int__() for i in shape])
 
 
 def ndim(x):
@@ -45,7 +57,7 @@ def ndim(x):
 def eval(x):
     '''Run a graph.
     '''
-    return x.eval(session=_get_session())
+    return x.eval(session=get_session())
 
 
 def zeros(shape, dtype=_FLOATX, name=None):
@@ -86,10 +98,13 @@ def transpose(x):
 
 
 def gather(reference, indices):
-    '''reference: a tensor.
-    indices: an int tensor of indices.
+    '''
+    # Arguments
+        reference: a tensor.
+        indices: an int tensor of indices.
 
-    Return: a tensor of same type as reference.
+    # Returns
+        a tensor of same type as `reference`.
     '''
     return tf.gather(reference, indices)
 
@@ -154,12 +169,12 @@ def mean(x, axis=None, keepdims=False):
 def any(x, axis=None, keepdims=False):
     '''Bitwise reduction (logical OR).
 
-    Return array of int8 (0s and 1s).
+    Return array of uint8 (0s and 1s).
     '''
     axis = normalize_axis(axis, ndim(x))
     x = tf.cast(x, tf.bool)
     x = tf.reduce_any(x, reduction_indices=axis, keep_dims=keepdims)
-    return tf.cast(x, tf.int8)
+    return tf.cast(x, tf.uint8)
 
 
 def argmax(x, axis=-1):
@@ -231,7 +246,10 @@ def minimum(x, y):
 
 def concatenate(tensors, axis=-1):
     if axis < 0:
-        axis = axis % len(tensors[0].get_shape())
+        if len(tensors[0].get_shape()):
+            axis = axis % len(tensors[0].get_shape())
+        else:
+            axis = 0
     return tf.concat(axis, tensors)
 
 
@@ -242,8 +260,9 @@ def reshape(x, shape):
 def permute_dimensions(x, pattern):
     '''Transpose dimensions.
 
-    pattern should be a tuple or list of
-    dimension indices, e.g. [0, 2, 1].
+    # Arguments
+        pattern: should be a tuple or list of
+            dimension indices, e.g. [0, 2, 1].
     '''
     return tf.transpose(x, perm=pattern)
 
@@ -256,15 +275,15 @@ def resize_images(X, height_factor, width_factor, dim_ordering):
     positive integers.
     '''
     if dim_ordering == 'th':
-        new_height = shape(X)[2].value * height_factor
-        new_width = shape(X)[3].value * width_factor
+        new_shape = tf.shape(X)[2:]
+        new_shape *= tf.constant(np.array([height_factor, width_factor]).astype('int32'))
         X = permute_dimensions(X, [0, 2, 3, 1])
-        X = tf.image.resize_nearest_neighbor(X, (new_height, new_width))
+        X = tf.image.resize_nearest_neighbor(X, new_shape)
         return permute_dimensions(X, [0, 3, 1, 2])
     elif dim_ordering == 'tf':
-        new_height = shape(X)[1].value * height_factor
-        new_width = shape(X)[2].value * width_factor
-        return tf.image.resize_nearest_neighbor(X, (new_height, new_width))
+        new_shape = tf.shape(X)[1:3]
+        new_shape *= tf.constant(np.array([height_factor, width_factor]).astype('int32'))
+        return tf.image.resize_nearest_neighbor(X, new_shape)
     else:
         raise Exception('Invalid dim_ordering: ' + dim_ordering)
 
@@ -289,6 +308,7 @@ def repeat(x, n):
     if x has shape (samples, dim) and n=2,
     the output will have shape (samples, 2, dim)
     '''
+    assert ndim(x) == 2
     tensors = [x] * n
     stacked = tf.pack(tensors)
     return tf.transpose(stacked, (1, 0, 2))
@@ -344,16 +364,21 @@ def spatial_2d_padding(x, padding=(1, 1), dim_ordering='th'):
     return tf.pad(x, pattern)
 
 
+def pack(x):
+    return tf.pack(x)
+
+
 # VALUE MANIPULATION
+
 
 def get_value(x):
     '''Technically the same as eval() for TF.
     '''
-    return x.eval(session=_get_session())
+    return x.eval(session=get_session())
 
 
 def set_value(x, value):
-    tf.assign(x, np.asarray(value)).op.run(session=_get_session())
+    tf.assign(x, np.asarray(value)).op.run(session=get_session())
 
 
 # GRAPH MANIPULATION
@@ -361,9 +386,9 @@ def set_value(x, value):
 class Function(object):
 
     def __init__(self, inputs, outputs, updates=[]):
-        assert type(inputs) in {list, tuple}
-        assert type(outputs) in {list, tuple}
-        assert type(updates) in {list, tuple}
+        assert type(inputs) in {list, tuple}, 'Input to a TensorFlow backend function should be a list or tuple.'
+        assert type(outputs) in {list, tuple}, 'Output to a TensorFlow backend function should be a list or tuple.'
+        assert type(updates) in {list, tuple}, 'Updates in a TensorFlow backend function should be a list or tuple.'
         self.inputs = list(inputs)
         self.outputs = list(outputs)
         with tf.control_dependencies(self.outputs):
@@ -373,12 +398,18 @@ class Function(object):
         assert type(inputs) in {list, tuple}
         names = [v.name for v in self.inputs]
         feed_dict = dict(zip(names, inputs))
-        session = _get_session()
+        session = get_session()
         updated = session.run(self.outputs + self.updates, feed_dict=feed_dict)
         return updated[:len(self.outputs)]
 
 
-def function(inputs, outputs, updates=[]):
+def function(inputs, outputs, updates=[], **kwargs):
+    if len(kwargs) > 0:
+        msg = [
+            "Expected no kwargs, you passed %s" % len(kwargs),
+            "kwargs passed to function are ignored with Tensorflow backend"
+        ]
+        warnings.warn('\n'.join(msg))
     return Function(inputs, outputs, updates=updates)
 
 
@@ -389,60 +420,47 @@ def gradients(loss, variables):
 # CONTROL FLOW
 
 def rnn(step_function, inputs, initial_states,
-        go_backwards=False, mask=None):
+        go_backwards=False, mask=None, constants=None):
     '''Iterates over the time dimension of a tensor.
 
-    Parameters
-    ----------
-    inputs: tensor of temporal data of shape (samples, time, ...)
-        (at least 3D).
-    step_function:
-        Parameters:
-            input: tensor with shape (samples, ...) (no time dimension),
-                representing input for the batch of samples at a certain
-                time step.
-            states: list of tensors.
-        Returns:
-            output: tensor with shape (samples, ...) (no time dimension),
-            new_states: list of tensors, same length and shapes
-                as 'states'.
-    initial_states: tensor with shape (samples, ...) (no time dimension),
-        containing the initial values for the states used in
-        the step function.
-    go_backwards: boolean. If True, do the iteration over
-        the time dimension in reverse order.
-    mask: binary tensor with shape (samples, time, 1),
-        with a zero for every element that is masked.
+    # Arguments
+        inputs: tensor of temporal data of shape (samples, time, ...)
+            (at least 3D).
+        step_function:
+            Parameters:
+                input: tensor with shape (samples, ...) (no time dimension),
+                    representing input for the batch of samples at a certain
+                    time step.
+                states: list of tensors.
+            Returns:
+                output: tensor with shape (samples, ...) (no time dimension),
+                new_states: list of tensors, same length and shapes
+                    as 'states'.
+        initial_states: tensor with shape (samples, ...) (no time dimension),
+            containing the initial values for the states used in
+            the step function.
+        go_backwards: boolean. If True, do the iteration over
+            the time dimension in reverse order.
+        mask: binary tensor with shape (samples, time, 1),
+            with a zero for every element that is masked.
+        constants: a list of constant values passed at each step.
 
-    Returns
-    -------
-    A tuple (last_output, outputs, new_states).
-        last_output: the latest output of the rnn, of shape (samples, ...)
-        outputs: tensor with shape (samples, time, ...) where each
-            entry outputs[s, t] is the output of the step function
-            at time t for sample s.
-        new_states: list of tensors, latest states returned by
-            the step function, of shape (samples, ...).
+    # Returns
+        A tuple (last_output, outputs, new_states).
+            last_output: the latest output of the rnn, of shape (samples, ...)
+            outputs: tensor with shape (samples, time, ...) where each
+                entry outputs[s, t] is the output of the step function
+                at time t for sample s.
+            new_states: list of tensors, latest states returned by
+                the step function, of shape (samples, ...).
     '''
     ndim = len(inputs.get_shape())
     assert ndim >= 3, "Input should be at least 3D."
     axes = [1, 0] + list(range(2, ndim))
     inputs = tf.transpose(inputs, (axes))
     input_list = tf.unpack(inputs)
-    if mask is None:
-        mask = ones_like(tf.slice(inputs, [0, 0, 0], [-1, -1, 1]))
-        inputs_shape = inputs.get_shape()
-
-        # TODO: the mask's shape should be automatically inferred, by
-        # tensorflow yet for some reason it fails to in some test-cases. This
-        # fixes the issue, but should be removed in future.
-        mask.set_shape([inputs_shape[0].value, inputs_shape[1].value, 1])
-        mask = tf.cast(mask, tf.bool)
-    else:
-        # Transpose not supported by bool tensor types, hence round-trip to uint8.
-        mask = tf.cast(tf.transpose(tf.cast(mask, tf.uint8), axes), tf.bool)
-
-    mask_list = tf.unpack(mask)
+    if constants is None:
+        constants = []
 
     states = initial_states
     successive_states = []
@@ -450,33 +468,49 @@ def rnn(step_function, inputs, initial_states,
     if go_backwards:
         input_list.reverse()
 
-    for input, mask_t in zip(input_list, mask_list):
-        output, new_states = step_function(input, states)
+    if mask is not None:
+        # Transpose not supported by bool tensor types, hence round-trip to uint8.
+        mask = tf.cast(mask, tf.uint8)
+        if len(mask.get_shape()) == ndim-1:
+            mask = expand_dims(mask)
+        mask = tf.cast(tf.transpose(mask, axes), tf.bool)
+        mask_list = tf.unpack(mask)
 
-        # tf.select needs its condition tensor to be the same shape as its two
-        # result tensors, but in our case the condition (mask) tensor is
-        # (nsamples, 1), and A and B are (nsamples, ndimensions). So we need to
-        # broadcast the mask to match the shape of A and B. That's what the
-        # tile call does, is just repeat the mask along its second dimension
-        # ndimensions times.
-        tiled_mask_t = tf.tile(mask_t, tf.pack([1, tf.shape(output)[1]]))
+        if go_backwards:
+            mask_list.reverse()
 
-        if len(successive_outputs) == 0:
-            prev_output = zeros_like(output)
-        else:
-            prev_output = successive_outputs[-1]
+        for input, mask_t in zip(input_list, mask_list):
+            output, new_states = step_function(input, states + constants)
 
-        output = tf.select(tiled_mask_t, output, prev_output)
+            # tf.select needs its condition tensor to be the same shape as its two
+            # result tensors, but in our case the condition (mask) tensor is
+            # (nsamples, 1), and A and B are (nsamples, ndimensions). So we need to
+            # broadcast the mask to match the shape of A and B. That's what the
+            # tile call does, is just repeat the mask along its second dimension
+            # ndimensions times.
+            tiled_mask_t = tf.tile(mask_t, tf.pack([1, tf.shape(output)[1]]))
 
-        return_states = []
-        for state, new_state in zip(states, new_states):
-            # (see earlier comment for tile explanation)
-            tiled_mask_t = tf.tile(mask_t, tf.pack([1, tf.shape(new_state)[1]]))
-            return_states.append(tf.select(tiled_mask_t, new_state, state))
+            if len(successive_outputs) == 0:
+                prev_output = zeros_like(output)
+            else:
+                prev_output = successive_outputs[-1]
 
-        states = return_states
-        successive_outputs.append(output)
-        successive_states.append(states)
+            output = tf.select(tiled_mask_t, output, prev_output)
+
+            return_states = []
+            for state, new_state in zip(states, new_states):
+                # (see earlier comment for tile explanation)
+                tiled_mask_t = tf.tile(mask_t, tf.pack([1, tf.shape(new_state)[1]]))
+                return_states.append(tf.select(tiled_mask_t, new_state, state))
+
+            states = return_states
+            successive_outputs.append(output)
+            successive_states.append(states)
+    else:
+        for input in input_list:
+            output, states = step_function(input, states + constants)
+            successive_outputs.append(output)
+            successive_states.append(states)
 
     last_output = successive_outputs[-1]
     outputs = tf.pack(successive_outputs)
@@ -488,7 +522,12 @@ def rnn(step_function, inputs, initial_states,
 
 
 def switch(condition, then_expression, else_expression):
-    '''condition: scalar tensor.
+    '''Switch between two operations depending on a scalar value.
+
+    # Arguments
+        condition: scalar tensor.
+        then_expression: TensorFlow operation.
+        else_expression: TensorFlow operation.
     '''
     return tf.python.control_flow_ops.cond(condition,
                                            lambda: then_expression,
@@ -500,14 +539,18 @@ def switch(condition, then_expression, else_expression):
 def relu(x, alpha=0., max_value=None):
     '''ReLU.
 
-    alpha: slope of negative section.
+    # Arguments
+        alpha: slope of negative section.
+        max_value: saturation threshold.
     '''
     negative_part = tf.nn.relu(-x)
     x = tf.nn.relu(x)
     if max_value is not None:
         x = tf.clip_by_value(x, tf.cast(0., dtype=_FLOATX),
                              tf.cast(max_value, dtype=_FLOATX))
-    x -= tf.constant(alpha, dtype=_FLOATX) * negative_part
+    if isinstance(alpha, (tuple, list, np.ndarray)) or np.isscalar(alpha):
+        alpha = tf.constant(alpha, dtype=_FLOATX)
+    x -= alpha * negative_part
     return x
 
 
@@ -526,13 +569,13 @@ def categorical_crossentropy(output, target, from_logits=False):
     if not from_logits:
         # scale preds so that the class probas of each sample sum to 1
         output /= tf.reduce_sum(output,
-                                reduction_indices=len(output.get_shape())-1,
+                                reduction_indices=len(output.get_shape()) - 1,
                                 keep_dims=True)
         # manual computation of crossentropy
         output = tf.clip_by_value(output, tf.cast(_EPSILON, dtype=_FLOATX),
-                                  tf.cast(1.-_EPSILON, dtype=_FLOATX))
+                                  tf.cast(1. - _EPSILON, dtype=_FLOATX))
         return - tf.reduce_sum(target * tf.log(output),
-                               reduction_indices=len(output.get_shape())-1)
+                               reduction_indices=len(output.get_shape()) - 1)
     else:
         return tf.nn.softmax_cross_entropy_with_logits(output, target)
 
@@ -584,11 +627,12 @@ def l2_normalize(x, axis):
 
 def conv2d(x, kernel, strides=(1, 1), border_mode='valid', dim_ordering='th',
            image_shape=None, filter_shape=None):
-    '''
-    Run on cuDNN if available.
-    border_mode: string, "same" or "valid".
-    dim_ordering: whether to use Theano or TensorFlow dimension ordering
-    in inputs/kernels/ouputs.
+    '''Runs on cuDNN if available.
+
+    # Arguments
+        border_mode: string, "same" or "valid".
+        dim_ordering: whether to use Theano or TensorFlow dimension ordering
+        in inputs/kernels/ouputs.
     '''
     if border_mode == 'same':
         padding = 'SAME'
@@ -628,10 +672,11 @@ def conv2d(x, kernel, strides=(1, 1), border_mode='valid', dim_ordering='th',
 def pool2d(x, pool_size, strides=(1, 1),
            border_mode='valid', dim_ordering='th', pool_mode='max'):
     '''
-    pool_size: tuple of 2 integers.
-    strides: tuple of 2 integers.
-    border_mode: one of "valid", "same".
-    dim_ordering: one of "th", "tf".
+    # Arguments
+        pool_size: tuple of 2 integers.
+        strides: tuple of 2 integers.
+        border_mode: one of "valid", "same".
+        dim_ordering: one of "th", "tf".
     '''
     if border_mode == 'same':
         padding = 'SAME'
@@ -686,3 +731,10 @@ def random_uniform(shape, low=0.0, high=1.0, dtype=_FLOATX, seed=None):
         seed = np.random.randint(10e6)
     return tf.random_uniform(shape, minval=low, maxval=high,
                              dtype=dtype, seed=seed)
+
+
+def random_binomial(shape, p=0.0, dtype=_FLOATX, seed=None):
+    if seed is None:
+        seed = np.random.randint(10e6)
+    return tf.select(tf.random_uniform(shape, dtype=dtype, seed=seed) <= p, 
+                     tf.ones(shape), tf.zeros(shape))

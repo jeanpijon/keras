@@ -1,5 +1,7 @@
 # Keras FAQ: Frequently Asked Keras Questions
 
+[How should I cite Keras?](#how-should-i-cite-keras)
+
 [How can I run Keras on GPU?](#how-can-i-run-keras-on-gpu)
 
 [How can I save a Keras model?](#how-can-i-save-a-keras-model)
@@ -7,8 +9,6 @@
 [Why is the training loss much higher than the testing loss?](#why-is-the-training-loss-much-higher-than-the-testing-loss)
 
 [How can I visualize the output of an intermediate layer?](#how-can-i-visualize-the-output-of-an-intermediate-layer)
-
-[Isn't there a bug with Merge or Graph related to input concatenation?](#isnt-there-a-bug-with-merge-or-graph-related-to-input-concatenation)
 
 [How can I use Keras with datasets that don't fit in memory?](#how-can-i-use-keras-with-datasets-that-dont-fit-in-memory)
 
@@ -24,7 +24,25 @@
 
 ---
 
+### How should I cite Keras?
+
+Please cite Keras in your publications if it helps your research. Here is an example BibTeX entry:
+
+```
+@misc{chollet2015keras,
+  author = {Chollet, François},
+  title = {Keras},
+  year = {2015},
+  publisher = {GitHub},
+  journal = {GitHub repository},
+  howpublished = {\url{https://github.com/fchollet/keras}}
+}
+```
+
 ### How can I run Keras on GPU?
+
+If you are running on the TensorFlow backend, your code will automatically run on GPU if any available GPU is detected.
+If you are running on the Theano backend, you can use one of the following methods:
 
 Method 1: use Theano flags.
 ```bash
@@ -69,7 +87,10 @@ model = model_from_json(json_string)
 model = model_from_yaml(yaml_string)
 ```
 
-If you need to save the weights of a model, you can do so in HDF5:
+If you need to save the weights of a model, you can do so in HDF5 with the code below.
+
+Note that you will first need to install HDF5 and the Python library h5py, which do not come bundled with Keras.
+
 ```python
 model.save_weights('my_model_weights.h5')
 ```
@@ -103,31 +124,23 @@ Besides, the training loss is the average of the losses over each batch of train
 
 ### How can I visualize the output of an intermediate layer?
 
-You can build a Theano function that will return the output of a certain layer given a certain input, for example:
+You can build a Keras function that will return the output of a certain layer given a certain input, for example:
 
 ```python
+from keras import backend as K
+
 # with a Sequential model
-get_3rd_layer_output = theano.function([model.layers[0].input],
-                                       model.layers[3].get_output(train=False))
-layer_output = get_3rd_layer_output(X)
+get_3rd_layer_output = K.function([model.layers[0].input],
+                                  [model.layers[3].get_output(train=False)])
+layer_output = get_3rd_layer_output([X])[0]
 
 # with a Graph model
-get_conv_layer_output = theano.function([model.inputs[i].input for i in model.input_order],
-                                        model.nodes['conv'].get_output(train=False),
-                                        on_unused_input='ignore')
-conv_output = get_conv_layer_output([input_data_dict[i] for i in model.input_order])
+get_conv_layer_output = K.function([model.inputs[i].input for i in model.input_order],
+                                   [model.nodes['conv'].get_output(train=False)])
+conv_output = get_conv_layer_output([input_data_dict[i] for i in model.input_order])[0]
 ```
 
----
-
-### Isn't there a bug with Merge or Graph related to input concatenation?
-
-Yes, there was a known bug with tensor concatenation in Theano that was fixed early 2015.
-Please upgrade to the latest version of Theano:
-
-```bash
-sudo pip install git+git://github.com/Theano/Theano.git
-```
+Similarly, you could build a Theano and TensorFlow function directly.
 
 ---
 
@@ -135,7 +148,9 @@ sudo pip install git+git://github.com/Theano/Theano.git
 
 You can do batch training using `model.train_on_batch(X, y)` and `model.test_on_batch(X, y)`. See the [models documentation](models.md).
 
-You can also see batch training in action in our [CIFAR10 example](https://github.com/fchollet/keras/blob/master/examples/cifar10_cnn.py).
+Alternatively, you can write a generator that yields batches of training data and use the method `model.fit_generator(data_generator, samples_per_epoch, nb_epoch)`.
+
+You can see batch training in action in our [CIFAR10 example](https://github.com/fchollet/keras/blob/master/examples/cifar10_cnn.py).
 
 ---
 

@@ -89,23 +89,47 @@ def weighted_objective(fn):
             #  to the number of unmasked samples.
             score_array /= K.mean(mask)
 
-        # reduce score_array to 1D
+        # reduce score_array to same ndim as weight array
         ndim = K.ndim(score_array)
-        for d in range(ndim-1):
-            score_array = K.mean(score_array, axis=-1)
+        weight_ndim = K.ndim(weights)
+        score_array = K.mean(score_array, axis=list(range(weight_ndim, ndim)))
 
+        # apply sample weighting
         if weights is not None:
             score_array *= weights
+            score_array /= K.mean(K.cast(K.not_equal(weights, 0), K.floatx()))
         return K.mean(score_array)
     return weighted
 
 
-def standardize_weights(y, sample_weight=None, class_weight=None):
+def standardize_weights(y, sample_weight=None, class_weight=None,
+                        sample_weight_mode=None):
+    '''Weight input validation and standardization to a single sample-wise
+    (or timestep-wise) weight array.
     '''
-    '''
+    if sample_weight_mode is not None:
+        if sample_weight_mode != 'temporal':
+            raise Exception('"sample_weight_mode '
+                            'should be None or "temporal".')
+        if y.ndim < 3:
+            raise Exception('Timestep-wise sample weighting (use of '
+                            'sample_weight_mode="temporal") is restricted to '
+                            'outputs that are at least 3D, i.e. that have '
+                            'a time dimension.')
+        if sample_weight is not None and sample_weight.ndim != 2:
+            raise Exception('In order to use timestep-wise sample weighting, '
+                            'you should pass a 2D sample_weight array.')
+    else:
+        if sample_weight is not None and sample_weight.ndim != 1:
+            raise Exception('In order to use timestep-wise sample weights, '
+                            'you should specify sample_weight_mode="temporal" '
+                            'in compile(). If you just mean to use '
+                            'sample-wise weights, make sure your '
+                            'sample_weight array is 1D.')
     if sample_weight is not None:
-        assert len(sample_weight) == len(y)
-        return sample_weight.flatten()
+        assert sample_weight.ndim <= y.ndim
+        assert y.shape[:sample_weight.ndim] == sample_weight.shape
+        return sample_weight
     elif isinstance(class_weight, dict):
         if len(y.shape) > 2:
             raise Exception('class_weight not supported for '
@@ -119,7 +143,10 @@ def standardize_weights(y, sample_weight=None, class_weight=None):
         weights = np.asarray([class_weight[cls] for cls in y_classes])
         return weights
     else:
-        return np.ones((y.shape[0],))
+        if sample_weight_mode is None:
+            return np.ones((y.shape[0],))
+        else:
+            return np.ones((y.shape[0], y.shape[1]))
 
 
 def model_from_yaml(yaml_string, custom_objects={}):
@@ -175,10 +202,15 @@ def model_from_config(config, custom_objects={}):
         optimizer = optimizers.get(optimizer_name, optimizer_params)
 
         if model_name == 'Sequential':
+            sample_weight_mode = config.get('sample_weight_mode')
             model.compile(loss=loss, optimizer=optimizer,
-                          class_mode=class_mode)
+                          class_mode=class_mode, sample_weight_mode=sample_weight_mode)
         elif model_name == 'Graph':
-            model.compile(loss=loss, optimizer=optimizer)
+            sample_weight_modes = config.get('sample_weight_modes', {})
+            loss_weights = config.get('loss_weights', {})
+            model.compile(loss=loss, optimizer=optimizer,
+                          sample_weight_modes=sample_weight_modes,
+                          loss_weights=loss_weights)
     return model
 
 
@@ -187,6 +219,39 @@ def get_function_name(o):
         return o
     else:
         return o.__name__
+
+
+def generator_queue(generator, max_q_size=10,
+                    wait_time=0.05, nb_worker=1):
+    '''Builds a threading queue out of a data generator.
+    Used in `fit_generator`, `evaluate_generator`.
+    '''
+    q = queue.Queue()
+    _stop = threading.Event()
+
+    def data_generator_task():
+        while not _stop.is_set():
+            try:
+                if q.qsize() < max_q_size:
+                    try:
+                        generator_output = next(generator)
+                    except ValueError:
+                        continue
+                    q.put(generator_output)
+                else:
+                    time.sleep(wait_time)
+            except Exception:
+                _stop.set()
+                raise
+
+    generator_threads = [threading.Thread(target=data_generator_task)
+                         for _ in range(nb_worker)]
+
+    for thread in generator_threads:
+        thread.daemon = True
+        thread.start()
+
+    return q, _stop
 
 
 class Model(object):
@@ -211,11 +276,10 @@ class Model(object):
         nb_train_sample = len(ins[0])
         index_array = np.arange(nb_train_sample)
 
-        history = cbks.History()
+        self.history = cbks.History()
+        callbacks = [cbks.BaseLogger()] + callbacks + [self.history]
         if verbose:
-            callbacks = [history, cbks.BaseLogger()] + callbacks
-        else:
-            callbacks = [history] + callbacks
+            callbacks += [cbks.ProgbarLogger()]
         callbacks = cbks.CallbackList(callbacks)
 
         callbacks._set_model(self)
@@ -277,7 +341,7 @@ class Model(object):
                 break
 
         callbacks.on_train_end()
-        return history
+        return self.history
 
     def _predict_loop(self, f, ins, batch_size=128, verbose=0):
         '''Abstract method to loop over some data in batches.
@@ -345,7 +409,7 @@ class Model(object):
         `keras.models.model_from_config(config, custom_objects={})`.
         '''
         config = super(Model, self).get_config()
-        for p in ['class_mode']:
+        for p in ['sample_weight_mode', 'sample_weight_modes', 'loss_weights']:
             if hasattr(self, p):
                 config[p] = getattr(self, p)
         if hasattr(self, 'optimizer'):
@@ -355,7 +419,6 @@ class Model(object):
                 config['loss'] = dict([(k, get_function_name(v)) for k, v in self.loss.items()])
             else:
                 config['loss'] = get_function_name(self.loss)
-
         if verbose:
             pp = pprint.PrettyPrinter(indent=4)
             pp.pprint(config)
@@ -384,7 +447,6 @@ class Model(object):
         import json
 
         def get_json_type(obj):
-
             # if obj is any numpy type
             if type(obj).__module__ == np.__name__:
                 return obj.item()
@@ -411,7 +473,9 @@ class Sequential(Model, containers.Sequential):
     Inherits from containers.Sequential.
     '''
     def compile(self, optimizer, loss,
-                class_mode="categorical"):
+                class_mode=None,
+                sample_weight_mode=None,
+                **kwargs):
         '''Configure the learning process.
 
         # Arguments
@@ -419,11 +483,19 @@ class Sequential(Model, containers.Sequential):
                 See [optimizers](optimizers.md).
             loss: str (name of objective function) or objective function.
                 See [objectives](objectives.md).
-            class_mode: one of "categorical", "binary".
-                This is only used for computing classification accuracy or
-                using the predict_classes method.
+            class_mode: deprecated argument,
+                it is set automatically starting with Keras 0.3.3.
+            sample_weight_mode: if you need to do timestep-wise
+                sample weighting (2D weights), set this to "temporal".
+                "None" defaults to sample-wise weights (1D).
+            kwargs: for Theano backend, these are passed into K.function.
+                Ignored for Tensorflow backend.
         '''
+        if class_mode is not None:
+            warnings.warn('The "class_mode" argument is deprecated, please remove it from your code.')
+
         self.optimizer = optimizers.get(optimizer)
+        self.sample_weight_mode = sample_weight_mode
 
         self.loss = objectives.get(loss)
         weighted_loss = weighted_objective(self.loss)
@@ -437,32 +509,43 @@ class Sequential(Model, containers.Sequential):
 
         # target of model
         self.y = K.placeholder(ndim=K.ndim(self.y_train))
-        # weights: one scalar per sample
-        self.weights = K.placeholder(ndim=1)
 
-        if hasattr(self.layers[-1], "get_output_mask"):
+        if self.sample_weight_mode == 'temporal':
+            self.weights = K.placeholder(ndim=2)
+        else:
+            self.weights = K.placeholder(ndim=1)
+
+        if hasattr(self.layers[-1], 'get_output_mask'):
             mask = self.layers[-1].get_output_mask()
         else:
             mask = None
         train_loss = weighted_loss(self.y, self.y_train, self.weights, mask)
         test_loss = weighted_loss(self.y, self.y_test, self.weights, mask)
 
-        if class_mode == "categorical":
+        # set class_mode, for accuracy computation:
+        if self.output_shape[-1] == 1:
+            class_mode = 'binary'
+        else:
+            class_mode = 'categorical'
+        self.class_mode = class_mode
+
+        if class_mode == 'categorical':
             train_accuracy = K.mean(K.equal(K.argmax(self.y, axis=-1),
                                             K.argmax(self.y_train, axis=-1)))
             test_accuracy = K.mean(K.equal(K.argmax(self.y, axis=-1),
                                            K.argmax(self.y_test, axis=-1)))
-
-        elif class_mode == "binary":
+        elif class_mode == 'binary':
+            if self.loss.__name__ == 'categorical_crossentropy':
+                warnings.warn('Your model output has shape ' + str(self.output_shape) +
+                              ' (1-dimensional features), but you are using ' +
+                              ' the `categorical_crossentropy` loss. You ' +
+                              'almost certainly want to use `binary_crossentropy` instead.')
             train_accuracy = K.mean(K.equal(self.y, K.round(self.y_train)))
             test_accuracy = K.mean(K.equal(self.y, K.round(self.y_test)))
-        else:
-            raise Exception("Invalid class mode:" + str(class_mode))
-        self.class_mode = class_mode
 
         for r in self.regularizers:
             train_loss = r(train_loss)
-        updates = self.optimizer.get_updates(self.params,
+        updates = self.optimizer.get_updates(self.trainable_weights,
                                              self.constraints,
                                              train_loss)
         updates += self.updates
@@ -477,11 +560,18 @@ class Sequential(Model, containers.Sequential):
             test_ins = [self.X_test, self.y, self.weights]
             predict_ins = [self.X_test]
 
-        self._train = K.function(train_ins, [train_loss], updates=updates)
-        self._train_with_acc = K.function(train_ins, [train_loss, train_accuracy], updates=updates)
-        self._predict = K.function(predict_ins, [self.y_test], updates=self.state_updates)
-        self._test = K.function(test_ins, [test_loss], updates=self.state_updates)
-        self._test_with_acc = K.function(test_ins, [test_loss, test_accuracy], updates=self.state_updates)
+        self._train = K.function(train_ins, [train_loss],
+                                 updates=updates, **kwargs)
+        self._train_with_acc = K.function(train_ins,
+                                          [train_loss, train_accuracy],
+                                          updates=updates, **kwargs)
+        self._predict = K.function(predict_ins, [self.y_test],
+                                   updates=self.state_updates, **kwargs)
+        self._test = K.function(test_ins, [test_loss],
+                                updates=self.state_updates, **kwargs)
+        self._test_with_acc = K.function(test_ins,
+                                         [test_loss, test_accuracy],
+                                         updates=self.state_updates, **kwargs)
 
     def fit(self, X, y, batch_size=128, nb_epoch=100, verbose=1, callbacks=[],
             validation_split=0., validation_data=None, shuffle=True,
@@ -514,9 +604,16 @@ class Sequential(Model, containers.Sequential):
                 class accuracy in the logs to stdout at each epoch.
             class_weight: dictionary mapping classes to a weight value,
                 used for scaling the loss function (during training only).
-            sample_weight: list or numpy array with 1:1 mapping to
+            sample_weight: list or numpy array of weights for
                 the training samples, used for scaling the loss function
-                (during training only).
+                (during training only). You can either pass a flat (1D)
+                Numpy array with the same length as the input samples
+                (1:1 mapping between weights and samples),
+                or in the case of temporal data,
+                you can pass a 2D array with shape (samples, sequence_length),
+                to apply a different weight to every timestep of every sample.
+                In this case you should make sure to specify
+                sample_weight_mode="temporal" in compile().
         '''
         if type(X) == list:
             if len(set([len(a) for a in X] + [len(y)])) != 1:
@@ -562,7 +659,8 @@ class Sequential(Model, containers.Sequential):
                 X_val = standardize_X(X_val)
                 y_val = standardize_y(y_val)
                 sample_weight_val = standardize_weights(y_val,
-                                                        sample_weight=sample_weight_val)
+                                                        sample_weight=sample_weight_val,
+                                                        sample_weight_mode=self.sample_weight_mode)
             else:
                 raise Exception('Invalid format for validation data; '
                                 'provide a tuple (X_val, y_val) or '
@@ -578,7 +676,8 @@ class Sequential(Model, containers.Sequential):
             if sample_weight is not None:
                 sample_weight, sample_weight_val = (slice_X(sample_weight, 0, split_at), slice_X(sample_weight, split_at))
                 sample_weight_val = standardize_weights(y_val,
-                                                        sample_weight=sample_weight_val)
+                                                        sample_weight=sample_weight_val,
+                                                        sample_weight_mode=self.sample_weight_mode)
             else:
                 sample_weight_val = standardize_weights(y_val)
             val_ins = X_val + [y_val, sample_weight_val]
@@ -591,7 +690,8 @@ class Sequential(Model, containers.Sequential):
             out_labels = ['loss']
 
         sample_weight = standardize_weights(y, class_weight=class_weight,
-                                            sample_weight=sample_weight)
+                                            sample_weight=sample_weight,
+                                            sample_weight_mode=self.sample_weight_mode)
         ins = X + [y, sample_weight]
         metrics = ['loss', 'acc', 'val_loss', 'val_acc']
         return self._fit(f, ins, out_labels=out_labels,
@@ -669,7 +769,8 @@ class Sequential(Model, containers.Sequential):
                                                   'as X and y.')
         X = standardize_X(X)
         y = standardize_y(y)
-        sample_weight = standardize_weights(y, sample_weight=sample_weight)
+        sample_weight = standardize_weights(y, sample_weight=sample_weight,
+                                            sample_weight_mode=self.sample_weight_mode)
 
         ins = X + [y, sample_weight]
         if show_accuracy:
@@ -698,7 +799,8 @@ class Sequential(Model, containers.Sequential):
         X = standardize_X(X)
         y = standardize_y(y)
         sample_weight = standardize_weights(y, class_weight=class_weight,
-                                            sample_weight=sample_weight)
+                                            sample_weight=sample_weight,
+                                            sample_weight_mode=self.sample_weight_mode)
         ins = X + [y, sample_weight]
         if accuracy:
             return self._train_with_acc(ins)
@@ -717,7 +819,8 @@ class Sequential(Model, containers.Sequential):
                                                   'as X and y.')
         X = standardize_X(X)
         y = standardize_y(y)
-        sample_weight = standardize_weights(y, sample_weight=sample_weight)
+        sample_weight = standardize_weights(y, sample_weight=sample_weight,
+                                            sample_weight_mode=self.sample_weight_mode)
 
         ins = X + [y, sample_weight]
         if accuracy:
@@ -768,7 +871,7 @@ class Sequential(Model, containers.Sequential):
         '''Load all layer weights from a HDF5 save file.
         '''
         import h5py
-        f = h5py.File(filepath)
+        f = h5py.File(filepath, mode='r')
         for k in range(f.attrs['nb_layers']):
             # This method does not make use of Sequential.set_weights()
             # for backwards compatibility.
@@ -831,8 +934,7 @@ class Sequential(Model, containers.Sequential):
             class_weight: dictionary mapping class indices to a weight
                 for the class.
         # Returns
-
-        A `History` object.
+            A `History` object.
 
         # Examples
 
@@ -863,11 +965,10 @@ class Sequential(Model, containers.Sequential):
         metrics = ['loss', 'acc', 'val_loss', 'val_acc']
 
         # prepare callbacks
-        history = cbks.History()
+        self.history = cbks.History()
+        callbacks = [cbks.BaseLogger()] + callbacks + [self.history]
         if verbose:
-            callbacks = [history, cbks.BaseLogger()] + callbacks
-        else:
-            callbacks = [history] + callbacks
+            callbacks += [cbks.ProgbarLogger()]
         callbacks = cbks.CallbackList(callbacks)
 
         callbacks._set_model(self)
@@ -931,7 +1032,7 @@ class Sequential(Model, containers.Sequential):
             if self.stop_training:
                 break
         callbacks.on_train_end()
-        return history
+        return self.history
 
     def evaluate_on_generator(self, data_generator, verbose=1, show_accuracy=False, class_weight=None):
         outs = []
@@ -984,7 +1085,8 @@ class Graph(Model, containers.Graph):
 
     Inherits from `containers.Graph`.
     '''
-    def compile(self, optimizer, loss):
+    def compile(self, optimizer, loss, sample_weight_modes={},
+                loss_weights={}, **kwargs):
         '''Configure the learning process.
 
         # Arguments
@@ -993,7 +1095,24 @@ class Graph(Model, containers.Graph):
             loss: dictionary mapping the name(s) of the output(s) to
                 a loss function (string name of objective function or
                 objective function. See [objectives](objectives.md)).
+            sample_weight_modes: optional dictionary mapping certain
+                output names to a sample weight mode ("temporal" and None
+                are the only supported modes). If you need to do
+                timestep-wise loss weighting on one of your graph outputs,
+                you will need to set the sample weight mode for this output
+                to "temporal".
+            loss_weights: dictionary you can pass to specify a weight
+                coefficient for each loss function (in a multi-output model).
+                If no loss weight is specified for an output,
+                the weight for this output's loss will be considered to be 1.
+            kwargs: for Theano backend, these are passed into K.function.
+                Ignored for Tensorflow backend.
         '''
+        assert type(loss) is dict, 'The "loss" argument should be a dictionary.'
+        assert type(sample_weight_modes) is dict, 'The "sample_weight_modes" argument should be a dictionary.'
+
+        self.sample_weight_modes = sample_weight_modes
+        self.loss_weights = loss_weights
         ys = []
         ys_train = []
         ys_test = []
@@ -1015,11 +1134,48 @@ class Graph(Model, containers.Graph):
             else:
                 mask = None
 
-            weight = K.placeholder(ndim=1)
+            if sample_weight_modes.get(output_name) == 'temporal':
+                weight = K.placeholder(ndim=2)
+            else:
+                weight = K.placeholder(ndim=1)
             weights.append(weight)
             weighted_loss = weighted_objective(objectives.get(loss_fn))
-            train_loss += weighted_loss(y, y_train, weight, mask)
-            test_loss += weighted_loss(y, y_test, weight, mask)
+            train_loss += loss_weights.get(output_name, 1.) * weighted_loss(y, y_train, weight, mask)
+            test_loss += loss_weights.get(output_name, 1.) * weighted_loss(y, y_test, weight, mask)
+
+        # deal with accuracy computation
+        if len(self.output_order) == 1:
+            y = ys[0]
+            y_train = ys_train[0]
+            y_test = ys_test[0]
+            # set class_mode, for accuracy computation:
+            if self.outputs[self.output_order[0]].output_shape[-1] == 1:
+                class_mode = 'binary'
+            else:
+                class_mode = 'categorical'
+            self.class_mode = class_mode
+
+            if class_mode == 'categorical':
+                train_accuracy = K.mean(K.equal(K.argmax(y, axis=-1),
+                                                K.argmax(y_train, axis=-1)))
+                test_accuracy = K.mean(K.equal(K.argmax(y, axis=-1),
+                                               K.argmax(y_test, axis=-1)))
+            elif class_mode == 'binary':
+                is_categorical_xent = False
+                loss_type = loss[self.output_order[0]]
+                if loss_type == 'categorical_crossentropy':
+                    is_categorical_xent = True
+                if hasattr(loss_type, '__name__') and loss_type.__name__ == 'categorical_crossentropy':
+                    is_categorical_xent = True
+                if is_categorical_xent:
+                    warnings.warn('Your model output has shape ' + str(self.output_shape) +
+                                  ' (1-dimensional features), but you are using ' +
+                                  ' the `categorical_crossentropy` loss. You ' +
+                                  'almost certainly want to use `binary_crossentropy` instead.')
+                train_accuracy = K.mean(K.equal(y, K.round(y_train)))
+                test_accuracy = K.mean(K.equal(y, K.round(y_test)))
+        else:
+            self.class_mode = None
 
         ins = [self.inputs[name].input for name in self.input_order]
         train_ins = ins + ys + weights
@@ -1028,19 +1184,28 @@ class Graph(Model, containers.Graph):
         for r in self.regularizers:
             train_loss = r(train_loss)
         self.optimizer = optimizers.get(optimizer)
-        updates = self.optimizer.get_updates(self.params,
+        updates = self.optimizer.get_updates(self.trainable_weights,
                                              self.constraints,
                                              train_loss)
         updates += self.updates
         self.loss = loss
 
-        self._train = K.function(train_ins, [train_loss], updates=updates)
-        self._test = K.function(test_ins, [test_loss], updates=self.state_updates)
+        self._train = K.function(train_ins, [train_loss],
+                                 updates=updates, **kwargs)
+        if self.class_mode:
+            self._train_with_acc = K.function(train_ins, [train_loss, train_accuracy],
+                                              updates=updates, **kwargs)
+        self._test = K.function(test_ins, [test_loss],
+                                updates=self.state_updates, **kwargs)
+        if self.class_mode:
+            self._test_with_acc = K.function(test_ins, [test_loss, test_accuracy],
+                                             updates=self.state_updates, **kwargs)
         self._predict = K.function(inputs=ins, outputs=ys_test,
-                                   updates=self.state_updates)
+                                   updates=self.state_updates, **kwargs)
 
     def fit(self, data, batch_size=128, nb_epoch=100, verbose=1, callbacks=[],
             validation_split=0., validation_data=None, shuffle=True,
+            show_accuracy=False,
             class_weight={}, sample_weight={}):
         '''Train the model for a fixed number of epochs.
 
@@ -1066,11 +1231,19 @@ class Graph(Model, containers.Graph):
                 All arrays should contain the same number of samples.
                 Will override validation_split.
             shuffle: boolean. Whether to shuffle the samples at each epoch.
+            show_accuracy: whether to log accuracy.
+                Can only be used if your Graph has a single output (otherwise "accuracy"
+                is ill-defined).
             class_weight: dictionary mapping output names to
                 class weight dictionaries.
             sample_weight: dictionary mapping output names to
                 numpy arrays of sample weights.
         '''
+        if show_accuracy:
+            if len(self.output_order) != 1:
+                raise Exception('In a Graph model, "show_accuracy" can only '
+                                'be used if your Graph has exactly one output.'
+                                ' Otherwise accuracy is ill-defined.')
         X = [data[name] for name in self.input_order]
         y = [standardize_y(data[name]) for name in self.output_order]
         if len(set([len(a) for a in X] + [len(a) for a in y])) != 1:
@@ -1078,7 +1251,8 @@ class Graph(Model, containers.Graph):
                             'the same number of samples.')
 
         sample_weight_list = [standardize_weights(y[i],
-                                                  sample_weight=sample_weight.get(self.output_order[i])) for i in range(len(self.output_order))]
+                                                  sample_weight=sample_weight.get(self.output_order[i]),
+                                                  sample_weight_mode=self.sample_weight_modes.get(self.output_order[i])) for i in range(len(self.output_order))]
         class_weight_list = [class_weight.get(name) for name in self.output_order]
 
         val_f = None
@@ -1098,13 +1272,19 @@ class Graph(Model, containers.Graph):
             sample_weight_list, sample_weight_list_val = (slice_X(sample_weight_list, 0, split_at), slice_X(sample_weight_list, split_at))
             val_ins = X_val + y_val + sample_weight_list_val
 
-        f = self._train
-        out_labels = ['loss']
-        metrics = ['loss', 'val_loss']
+        if self.class_mode and show_accuracy:
+            f = self._train_with_acc
+            out_labels = ['loss', 'acc']
+            metrics = ['loss', 'acc', 'val_loss', 'val_acc']
+        else:
+            f = self._train
+            out_labels = ['loss']
+            metrics = ['loss', 'val_loss']
 
         sample_weight_list = [standardize_weights(y[i],
                                                   sample_weight=sample_weight_list[i],
-                                                  class_weight=class_weight_list[i]) for i in range(len(self.output_order))]
+                                                  class_weight=class_weight_list[i],
+                                                  sample_weight_mode=self.sample_weight_modes.get(self.output_order[i])) for i in range(len(self.output_order))]
         ins = X + y + sample_weight_list
         history = self._fit(f, ins, out_labels=out_labels,
                             batch_size=batch_size, nb_epoch=nb_epoch,
@@ -1113,19 +1293,35 @@ class Graph(Model, containers.Graph):
                             shuffle=shuffle, metrics=metrics)
         return history
 
-    def evaluate(self, data, batch_size=128, verbose=0, sample_weight={}):
+    def evaluate(self, data, batch_size=128, show_accuracy=False,
+                 verbose=0, sample_weight={}):
         '''Compute the loss on some input data, batch by batch.
+
+        Returns the loss over the data,
+        or a tuple `(loss, accuracy)` if `show_accuracy=True`.
 
         Arguments: see `fit` method.
         '''
         sample_weight = [standardize_weights(data[name],
-                                             sample_weight=sample_weight.get(name)) for name in self.output_order]
+                                             sample_weight=sample_weight.get(name),
+                                             sample_weight_mode=self.sample_weight_modes.get(name)) for name in self.output_order]
         ins = [data[name] for name in self.input_order] + [standardize_y(data[name]) for name in self.output_order] + sample_weight
         if len(set([len(a) for a in ins])) != 1:
             raise Exception('All input arrays and target arrays must have '
                             'the same number of samples.')
-        outs = self._test_loop(self._test, ins, batch_size, verbose)
-        return outs[0]
+        if show_accuracy:
+            if len(self.output_order) != 1:
+                raise Exception('In a Graph model, "show_accuracy" can only '
+                                'be used if your Graph has exactly one output.'
+                                ' Otherwise accuracy is ill-defined.')
+            fn = self._test_with_acc
+        else:
+            fn = self._test
+        outs = self._test_loop(fn, ins, batch_size, verbose)
+        if show_accuracy:
+            return outs
+        else:
+            return outs[0]
 
     def predict(self, data, batch_size=128, verbose=0):
         '''Generate output predictions for the input samples
@@ -1140,31 +1336,52 @@ class Graph(Model, containers.Graph):
         outs = self._predict_loop(self._predict, ins, batch_size, verbose)
         return dict(zip(self.output_order, outs))
 
-    def train_on_batch(self, data, class_weight={}, sample_weight={}):
+    def train_on_batch(self, data, accuracy=False,
+                       class_weight={}, sample_weight={}):
         '''Single gradient update on a batch of samples.
+
+        Returns the loss over the data,
+        or a tuple `(loss, accuracy)` if `accuracy=True`.
 
         Arguments: see `fit` method.
         '''
         sample_weight = [standardize_weights(data[name],
                                              sample_weight=sample_weight.get(name),
-                                             class_weight=class_weight.get(name)) for name in self.output_order]
+                                             class_weight=class_weight.get(name),
+                                             sample_weight_mode=self.sample_weight_modes.get(name)) for name in self.output_order]
         ins = [data[name] for name in self.input_order] + [standardize_y(data[name]) for name in self.output_order] + sample_weight
         if len(set([len(a) for a in ins])) != 1:
             raise Exception('All input arrays and target arrays must have '
                             'the same number of samples.')
+        if accuracy:
+            if len(self.output_order) != 1:
+                raise Exception('In a Graph model, "accuracy" can only '
+                                'be used if your Graph has exactly one output.'
+                                ' Otherwise accuracy is ill-defined.')
+            return self._train_with_acc(ins)
         return self._train(ins)
 
-    def test_on_batch(self, data, sample_weight={}):
-        '''Compute the loss on a single batch of samples.
+    def test_on_batch(self, data, accuracy=False, sample_weight={}):
+        '''Test the network on a single batch of samples.
+
+        If `accuracy`, it returns a tuple `(loss, accuracy)`,
+        otherwise it returns the loss value.
 
         Arguments: see `fit` method.
         '''
         sample_weight = [standardize_weights(data[name],
-                                             sample_weight=sample_weight.get(name)) for name in self.output_order]
+                                             sample_weight=sample_weight.get(name),
+                                             sample_weight_mode=self.sample_weight_modes.get(name)) for name in self.output_order]
         ins = [data[name] for name in self.input_order] + [standardize_y(data[name]) for name in self.output_order] + sample_weight
         if len(set([len(a) for a in ins])) != 1:
             raise Exception('All input arrays and target arrays must have '
                             'the same number of samples.')
+        if accuracy:
+            if len(self.output_order) != 1:
+                raise Exception('In a Graph model, "accuracy" can only '
+                                'be used if your Graph has exactly one output.'
+                                ' Otherwise accuracy is ill-defined.')
+            return self._test_with_acc(ins)
         return self._test(ins)
 
     def predict_on_batch(self, data):
@@ -1212,7 +1429,7 @@ class Graph(Model, containers.Graph):
         '''Load weights from a HDF5 file.
         '''
         import h5py
-        f = h5py.File(filepath)
+        f = h5py.File(filepath, mode='r')
         g = f['graph']
         weights = [g['param_{}'.format(p)] for p in range(g.attrs['nb_params'])]
         self.set_weights(weights)
@@ -1240,11 +1457,20 @@ class Graph(Model, containers.Graph):
                 going to the next epoch.
             nb_epoch: integer, total number of iterations on the data.
             verbose: verbosity mode, 0, 1, or 2.
+            show_accuracy: whether to log accuracy.
+                Can only be used if your Graph has a single output (otherwise "accuracy"
+                is ill-defined).
             callbacks: list of callbacks to be called during training.
             validation_data: dictionary mapping input names and outputs names
                 to appropriate numpy arrays to be used as
-                held-out validation data.
-                All arrays should contain the same number of samples.
+                held-out validation data, or a generator yielding such
+                dictionaries. All arrays should contain the same number
+                of samples. If a generator, will be called until more than
+                `nb_val_samples` examples have been generated at the
+                end of every epoch. These examples will then be used
+                as the validation data.
+            nb_val_samples: number of samples to use from validation
+                generator at the end of every epoch.
             class_weight: dictionary mapping class indices to a weight
                 for the class.
             nb_worker: integer, number of workers to use for running
@@ -1254,43 +1480,63 @@ class Graph(Model, containers.Graph):
                 If using multiple workers, make sure to protect
                 any thread-unsafe operation done by the generator
                 using a Python mutex.
+            nb_val_worker: same as `nb_worker`, except for validation data.
+                Has no effect if no validation data or validation data is
+                not a generator. If `None`, defaults to nb_worker.
+
 
         # Returns
-
-        A `History` object.
+            A `History` object.
 
         # Examples
 
         ```python
-        def generate_arrays_from_file(path):
-            while 1:
-                f = open(path)
-                for line in f:
-                    # create numpy arrays of input data
-                    # and labels, from each line in the file
-                    x1, x2, y = process_line(line)
-                    yield {'input_1': x1, 'input_2': x2, 'output': y}
-                f.close()
+            def generate_arrays_from_file(path):
+                while 1:
+                    f = open(path)
+                    for line in f:
+                        # create numpy arrays of input data
+                        # and labels, from each line in the file
+                        x1, x2, y = process_line(line)
+                        yield {'input_1': x1, 'input_2': x2, 'output': y}
+                    f.close()
 
-        graph.fit_generator(generate_arrays_from_file('/my_file.txt'),
-                            samples_per_epoch=10000, nb_epoch=10)
+            graph.fit_generator(generate_arrays_from_file('/my_file.txt'),
+                                samples_per_epoch=10000, nb_epoch=10)
         ```
         '''
-        max_queue_size = 10  # maximum number of batches in queue
+        max_data_q_size = 10  # maximum number of batches in queue
+
         wait_time = 0.05  # in seconds
         epoch = 0
+
         do_validation = bool(validation_data)
-        out_labels = ['loss']
-        metrics = ['loss', 'val_loss']
+        val_gen = (hasattr(validation_data, 'next') or
+                   hasattr(validation_data, '__next__'))
+        if val_gen and not nb_val_samples:
+            raise Exception('When using a generator for validation data, '
+                            'you must specify a value for "nb_val_samples".')
+        if nb_val_worker is None:
+            nb_val_worker = nb_worker
+
+        if show_accuracy:
+            if len(self.output_order) != 1:
+                raise Exception('In a Graph model, "show_accuracy" can only '
+                                'be used if your Graph has exactly one output.'
+                                ' Otherwise accuracy is ill-defined.')
+            out_labels = ['loss', 'acc']
+            metrics = ['loss', 'acc', 'val_loss', 'val_acc']
+        else:
+            out_labels = ['loss']
+            metrics = ['loss', 'val_loss']
         if not class_weight:
             class_weight = {}
 
         # prepare callbacks
-        history = cbks.History()
+        self.history = cbks.History()
+        callbacks = [cbks.BaseLogger()] + callbacks + [self.history]
         if verbose:
-            callbacks = [history, cbks.BaseLogger()] + callbacks
-        else:
-            callbacks = [history] + callbacks
+            callbacks += [cbks.ProgbarLogger()]
         callbacks = cbks.CallbackList(callbacks)
 
         callbacks._set_model(self)
@@ -1302,33 +1548,6 @@ class Graph(Model, containers.Graph):
             'metrics': metrics,
         })
         callbacks.on_train_begin()
-
-        # util function to validate the batches produced
-        # by the generator
-        def input_validation(generator_output):
-            if type(generator_output) in [list, tuple]:
-                if len(generator_output) == 2:
-                    data, sample_weight = generator_output
-                else:
-                    _stop.set()
-                    raise Exception('The generator output tuple must have '
-                                    '2 dictionary elements: '
-                                    '(data, sample_weight).')
-            elif type(generator_output) == dict:
-                data = generator_output
-                sample_weight = {}
-            else:
-                _stop.set()
-                raise Exception('The generator output must be '
-                                'a data dictionary or a tuple '
-                                '(data, sample_weight).')
-            assert type(data) == dict
-            assert type(sample_weight) == dict
-            if len(set([len(data[name]) for name in data.keys()] +
-                       [len(sample_weight[name]) for name in sample_weight.keys()])) != 1:
-                raise Exception('All input arrays and target arrays must have '
-                                'the same number of samples.')
-            return data, sample_weight
 
         # start generator thread storing batches into a queue
         generator_queue = queue.Queue()
@@ -1358,15 +1577,15 @@ class Graph(Model, containers.Graph):
             samples_seen = 0
             batch_index = 0
             while samples_seen < samples_per_epoch:
-                while not _stop.is_set():
-                    if not generator_queue.empty():
-                        generator_output = generator_queue.get()
+                while not _data_stop.is_set():
+                    if not data_gen_queue.empty():
+                        generator_output = data_gen_queue.get()
                         break
                     else:
                         time.sleep(wait_time)
 
-                data, sample_weight = input_validation(generator_output)
-
+                data, sample_weight = self._check_generator_output(generator_output,
+                                                                   _data_stop)
                 batch_logs = {}
                 batch_size = len(data[list(data.keys())[0]])
                 batch_logs['batch'] = batch_index
@@ -1374,7 +1593,8 @@ class Graph(Model, containers.Graph):
                 callbacks.on_batch_begin(batch_index, batch_logs)
                 outs = self.train_on_batch(data,
                                            sample_weight=sample_weight,
-                                           class_weight=class_weight)
+                                           class_weight=class_weight,
+                                           accuracy=show_accuracy)
                 if type(outs) != list:
                     outs = [outs]
                 for l, o in zip(out_labels, outs):
@@ -1386,29 +1606,30 @@ class Graph(Model, containers.Graph):
                 epoch_logs = {}
                 batch_index += 1
                 samples_seen += batch_size
-                if samples_seen >= samples_per_epoch:  # epoch finished
-                    if do_validation:
-                        if hasattr(validation_data, 'next'):
-                            # assumed to be generator
-                            # TODO: call self.evaluate_generator()
-                            _stop.set()
-                            raise NotImplementedError()
-                        else:
-                            # input validation
-                            data, sample_weight = input_validation(validation_data)
-                            val_outs = self.evaluate(data,
-                                                     sample_weight=sample_weight,
-                                                     verbose=0)
-                        if type(val_outs) != list:
-                            val_outs = [val_outs]
-                        # same labels assumed
-                        for l, o in zip(out_labels, val_outs):
-                            epoch_logs['val_' + l] = o
+                # epoch finished
+                if samples_seen >= samples_per_epoch and do_validation:
+                    if val_gen:
+                        val_outs = self.evaluate_generator(validation_data,
+                                                           nb_val_samples,
+                                                           verbose=0,
+                                                           show_accuracy=show_accuracy,
+                                                           nb_worker=nb_val_worker,
+                                                           wait_time=wait_time)
+                    else:
+                        val_outs = self.evaluate(data_val,
+                                                 sample_weight=sample_weight_val,
+                                                 show_accuracy=show_accuracy,
+                                                 verbose=0)
+                    if type(val_outs) != list:
+                        val_outs = [val_outs]
+                    # same labels assumed
+                    for l, o in zip(out_labels, val_outs):
+                        epoch_logs['val_' + l] = o
 
             callbacks.on_epoch_end(epoch, epoch_logs)
             epoch += 1
             if self.stop_training:
                 break
-        _stop.set()
+        _data_stop.set()
         callbacks.on_train_end()
-        return history
+        return self.history

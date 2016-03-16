@@ -5,6 +5,7 @@ from numpy.testing import assert_allclose
 
 from keras import backend as K
 from keras.layers import core
+from keras.layers import containers
 
 
 def test_input_output():
@@ -114,15 +115,41 @@ def test_autoencoder():
     _runner(layer)
 
 
-def test_autoencoder_second_layer():
-    # regression test for issue #1275
-    encoder = core.Dense(input_dim=10, output_dim=2)
-    decoder = core.Dense(input_dim=2, output_dim=10)
+def test_autoencoder_advanced():
+    encoder = containers.Sequential([core.Dense(5, input_shape=(10,))])
+    decoder = containers.Sequential([core.Dense(10, input_shape=(5,))])
+    X_train = np.random.random((100, 10))
+    X_test = np.random.random((100, 10))
+
     model = Sequential()
-    model.add(core.Dense(input_dim=20, output_dim=10))
-    model.add(core.AutoEncoder(encoder=encoder, decoder=decoder,
-                               output_reconstruction=False))
-    model.compile(loss='mse', optimizer='sgd')
+    model.add(core.Dense(output_dim=10, input_dim=10))
+    autoencoder = core.AutoEncoder(encoder=encoder, decoder=decoder,
+                                   output_reconstruction=True)
+    model.add(autoencoder)
+
+    # training the autoencoder:
+    model.compile(optimizer='sgd', loss='mse')
+    assert autoencoder.output_reconstruction
+
+    model.fit(X_train, X_train, nb_epoch=1, batch_size=32)
+
+    # predicting compressed representations of inputs:
+    autoencoder.output_reconstruction = False  # the autoencoder has to be recompiled after modifying this property
+    assert not autoencoder.output_reconstruction
+    model.compile(optimizer='sgd', loss='mse')
+    representations = model.predict(X_test)
+    assert representations.shape == (100, 5)
+
+    # the model is still trainable, although it now expects compressed representations as targets:
+    model.fit(X_test, representations, nb_epoch=1, batch_size=32)
+
+    # to keep training against the original inputs, just switch back output_reconstruction to True:
+    autoencoder.output_reconstruction = True
+    model.compile(optimizer='sgd', loss='mse')
+    model.fit(X_train, X_train, nb_epoch=1)
+
+    reconstructions = model.predict(X_test)
+    assert reconstructions.shape == (100, 10)
 
 
 def test_maxout_dense():
@@ -145,13 +172,11 @@ def test_naming():
     model.train_on_batch(np.random.random((2, 2)), np.random.random((2, 2)))
 
 
-@pytest.mark.skipif(K._BACKEND == 'tensorflow',
-                    reason='currently not working with TensorFlow')
 def test_sequences():
     '''Test masking sequences with zeroes as padding'''
     # integer inputs, one per timestep, like embeddings
-    layer = core.Masking()
-    func = K.function([layer.input], [layer.get_output_mask()])
+    layer = core.Masking(input_shape=(4, 1))
+    func = K.function([layer.get_input(True)], [layer.get_output_mask()])
     input_data = np.array([[[1], [2], [3], [0]],
                            [[0], [4], [5], [0]]], dtype=np.int32)
 
@@ -163,11 +188,9 @@ def test_sequences():
     assert np.all(output == expected), 'Output not as expected'
 
 
-@pytest.mark.skipif(K._BACKEND == 'tensorflow',
-                    reason='currently not working with TensorFlow')
 def test_non_zero():
     '''Test masking with non-zero mask value'''
-    layer = core.Masking(5)
+    layer = core.Masking(5, input_shape=(4, 2))
     func = K.function([layer.input], [layer.get_output_mask()])
     input_data = np.array([[[1, 1], [2, 1], [3, 1], [5, 5]],
                            [[1, 5], [5, 0], [0, 0], [0, 0]]],
@@ -177,11 +200,9 @@ def test_non_zero():
     assert np.all(output == expected), 'Output not as expected'
 
 
-@pytest.mark.skipif(K._BACKEND == 'tensorflow',
-                    reason='currently not working with TensorFlow')
 def test_non_zero_output():
     '''Test output of masking layer with non-zero mask value'''
-    layer = core.Masking(5)
+    layer = core.Masking(5, input_shape=(4, 2))
     func = K.function([layer.input], [layer.get_output()])
 
     input_data = np.array([[[1, 1], [2, 1], [3, 1], [5, 5]],
@@ -207,6 +228,7 @@ def _runner(layer):
     layer.trainable = True
     layer.trainable = False
 
+
 def test_siamese_all():
     right_input_layer = core.Dense(7, input_dim=3)
     left_input_layer = core.Dense(7, input_dim=3)
@@ -216,6 +238,7 @@ def test_siamese_all():
         siamese_layer = core.Siamese(shared_layer, [left_input_layer, right_input_layer], merge_mode=mode)
         siamese_layer.output_shape
         siamese_layer.get_output()
+
 
 @pytest.mark.skipif(K._BACKEND == 'tensorflow',
                     reason='currently not working with TensorFlow')

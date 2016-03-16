@@ -21,6 +21,7 @@ from scipy.optimize import fmin_l_bfgs_b
 import time
 import argparse
 import h5py
+import os
 
 from keras.models import Sequential
 from keras.layers.convolutional import Convolution2D, ZeroPadding2D, MaxPooling2D
@@ -121,6 +122,7 @@ model.add(MaxPooling2D((2, 2), strides=(2, 2)))
 # (trained on ImageNet, won the ILSVRC competition in 2014)
 # note: when there is a complete match between your model definition
 # and your weight savefile, you can simply call model.load_weights(filename)
+assert os.path.exists(weights_path), 'Model weights not found (see "weights_path" variable in script).'
 f = h5py.File(weights_path)
 for k in range(f.attrs['nb_layers']):
     if k >= len(model.layers):

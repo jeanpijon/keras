@@ -273,7 +273,7 @@ class TestBackend(object):
         check_single_tensor_operation('tanh', (4, 2))
 
         # dropout
-        val = np.random.random((20, 20))
+        val = np.random.random((100, 100))
         xth = KTH.variable(val)
         xtf = KTF.variable(val)
         zth = KTH.eval(KTH.dropout(xth, level=0.2))
@@ -330,28 +330,44 @@ class TestBackend(object):
     def test_random_normal(self):
         mean = 0.
         std = 1.
-        rand = KTF.get_value(KTF.random_normal((1000, 1000), mean=mean, std=std))
+        rand = KTF.eval(KTF.random_normal((1000, 1000), mean=mean, std=std))
         assert(rand.shape == (1000, 1000))
         assert(np.abs(np.mean(rand) - mean) < 0.01)
         assert(np.abs(np.std(rand) - std) < 0.01)
 
-        rand = KTF.get_value(KTF.random_normal((1000, 1000), mean=mean, std=std))
+        rand = KTH.eval(KTH.random_normal((1000, 1000), mean=mean, std=std))
         assert(rand.shape == (1000, 1000))
         assert(np.abs(np.mean(rand) - mean) < 0.01)
         assert(np.abs(np.std(rand) - std) < 0.01)
 
     def test_random_uniform(self):
-        mean = 0.
-        std = 1.
-        rand = KTF.get_value(KTF.random_normal((1000, 1000), mean=mean, std=std))
+        min = -1.
+        max = 1.
+        rand = KTF.eval(KTF.random_uniform((1000, 1000), min, max))
         assert(rand.shape == (1000, 1000))
-        assert(np.abs(np.mean(rand) - mean) < 0.01)
-        assert(np.abs(np.std(rand) - std) < 0.01)
+        assert(np.abs(np.mean(rand)) < 0.01)
+        assert(np.max(rand) <= max)
+        assert(np.min(rand) >= min)
 
-        rand = KTF.get_value(KTF.random_normal((1000, 1000), mean=mean, std=std))
+        rand = KTH.eval(KTH.random_uniform((1000, 1000), min, max))
         assert(rand.shape == (1000, 1000))
-        assert(np.abs(np.mean(rand) - mean) < 0.01)
-        assert(np.abs(np.std(rand) - std) < 0.01)
+        assert(np.abs(np.mean(rand)) < 0.01)
+        assert(np.max(rand) <= max)
+        assert(np.min(rand) >= min)
+
+    def test_random_binomial(self):
+        p = 0.5
+        rand = KTF.eval(KTF.random_binomial((1000, 1000), p))
+        assert(rand.shape == (1000, 1000))
+        assert(np.abs(np.mean(rand) - p) < 0.01)
+        assert(np.max(rand) == 1)
+        assert(np.min(rand) == 0)
+
+        rand = KTH.eval(KTH.random_binomial((1000, 1000), p))
+        assert(rand.shape == (1000, 1000))
+        assert(np.abs(np.mean(rand) - p) < 0.01)
+        assert(np.max(rand) == 1)
+        assert(np.min(rand) == 0)
 
 
 if __name__ == '__main__':
